@@ -30,7 +30,9 @@ SDK and for Laperm's `PluginKit`.
   | `laperm_handle` | `(i32 ptr, i32 len) -> i64`                                |
 
   `cabi_realloc` has the name and signature of the Component Model canonical ABI's allocator so
-  that a future move to components changes nothing on the author side. `new_size == 0` frees.
+  that a future move to components changes nothing on the author side. `new_size == 0` frees. The
+  signatures are checked, not only the names. `cabi_realloc` must not call `laperm.call` (Laperm calls it
+  while a host call is in progress; a nested host call stops the Plugin).
 
 ### Buffers
 
@@ -83,7 +85,8 @@ Error codes: `permission-denied`, `invalid-request`, `not-found`, `not-a-note`, 
 `too-large`, `io`, `unsupported`, `no-open-note`.
 
 Paths are relative to the Vault root, `/`-separated, without a leading `/`, and may not contain
-hidden components (`.laperm` and any other dot-prefixed name are refused with `invalid-request`).
+hidden components (`.laperm` and any other dot-prefixed name are refused with `invalid-request`). The check
+is made on the resolved path too: a symbolic link that leads into a hidden folder or out of the Vault is refused.
 
 | `op`             | Permission     | Request fields                                   | `value`                                                                 |
 |------------------|----------------|--------------------------------------------------|-------------------------------------------------------------------------|
@@ -92,8 +95,8 @@ hidden components (`.laperm` and any other dot-prefixed name are refused with `i
 | `settings.get`   | none           | —                                                | `{ values: { <key>: <value> } }` — every declared setting, Manifest defaults filled in |
 | `editor.get`     | `editor`       | —                                                | nil when no Note is open, else `{ path, text, version: i64, selection: { start, end } }` — `start`/`end` are **UTF-8 byte offsets** into `text` |
 | `editor.replace` | `editor`       | `version`, `start`, `end`, `text`                | `{ version }` (the new version). `conflict` if `version` is not the current one (the user typed since `editor.get`); `invalid-request` if the range is not on character boundaries; `no-open-note` |
-| `editor.open`    | `editor`       | `path`                                           | nil. `not-found` if there is no such Note, `not-a-note` if the path is not a Markdown file |
-| `vault.read`     | `vault.read`   | `path`                                           | `{ data: bin }` (any non-hidden file: Note or Attachment) |
+| `editor.open`    | `editor`       | `path`                                           | nil once the Note is open. `not-found` if there is no such Note, `not-a-note` if the path is not a Markdown file, `io` if it could not be opened (unreadable, or the current Note could not be saved). The `noteOpened` event carries `plugin:<id>` as its origin |
+| `vault.read`     | `vault.read`   | `path`                                           | `{ data: bin }` (any non-hidden file: Note or Attachment). Files over 32 MB are refused with `io` |
 | `vault.write`    | `vault.write`  | `path`, `data: bin`                              | nil. Creates missing parent folders. `conflict` if `path` is the open Note (use `editor.replace`). Produces `noteCreated` / `noteSaved` when the path is a Note |
 | `vault.exists`   | `vault.read`   | `path`                                           | `{ exists: bool, isFolder: bool }` |
 | `vault.list`     | `vault.read`   | `folder` (default `""`), `recursive` (default false) | `{ notes: [path], folders: [path] }` — Notes and folders only (no Attachments), sorted |
@@ -132,8 +135,8 @@ in v1.
 }
 ```
 
-- `id`: lowercase letters, digits and hyphens, 1–64 characters, must equal the folder name;
-  `laperm` is reserved.
+- `id`: lowercase letters, digits and hyphens, 1–64 characters, must equal the folder name (a Manifest
+  whose `id` differs from its folder is refused at load); `laperm` is reserved.
 - `version`: the release tag (semantic version, no `v` prefix).
 - `apiVersion` (required, integer): Laperm refuses to enable a Plugin whose `apiVersion` it does not
   support. `minAppVersion` is optional and compared with Laperm's marketing version.
@@ -145,7 +148,8 @@ in v1.
   (`cmd` / `shift` / `opt` / `ctrl` joined with `+`, then one key character, e.g. `cmd+shift+t`),
   optional `systemImage` (SF Symbol), `needsOpenNote` (default `true`). The Command ID in Laperm is
   `plugin.<pluginID>.<id>`; all of a Plugin's Commands live in the `plugins` group. A shortcut that
-  collides with a built-in Command or a Plugin enabled earlier is dropped (the item stays).
+  collides with a built-in Command or with a Plugin that sorts earlier by id is dropped (the item stays;
+  Laperm keeps no record of when a Plugin was enabled, so id order decides).
 - `events[]`: subset of the five event names.
 - `settings[]`: `key`, `label`, `type` (`bool` / `string` / `number` / `enum`), `default`, optional
   `description`, and for `enum` an `options[]` of `{ value, label }`. Laperm renders the form; the
@@ -158,6 +162,7 @@ in v1.
 | Fuel per Command (and `laperm_init`) | 10,000,000,000 (≈ one Wasm operator each; about 2.5 s on an M-series Mac in a release build, more on a phone) |
 | Fuel per event                  | 2,000,000,000                                |
 | Linear memory                   | 64 MB (growth beyond it fails, `memory.grow` returns -1) |
+| Tables                          | 1,000,000 elements per table, 4,000,000 allocated in total |
 | One message                     | 32 MB                                        |
 | Plugin Data                     | 4 MB encoded                                 |
 | Download (`manifest.json` + `plugin.wasm`) | 20 MB                             |
@@ -170,8 +175,9 @@ disables a Plugin. `Reload Plugins` starts everything again.
 ## 6. Distribution
 
 A release on GitHub carries two assets, `manifest.json` and `plugin.wasm`. Laperm fetches
-`https://github.com/<owner>/<repo>/releases/latest/download/{manifest.json,plugin.wasm}`, checks
-that the Manifest `id` matches, `apiVersion` is supported, the download is under 20 MB, the module
-parses, and its only import is `laperm.call`, then writes both files into
-`.laperm/plugins/<id>/`. Once a day per Plugin it fetches `manifest.json` again and offers an update
+`https://github.com/<owner>/<repo>/releases/latest/download/manifest.json`, follows the redirect to the
+release's tag and fetches `plugin.wasm` from that same tag (so both assets come from one release), checks
+that the Manifest `id` matches, `apiVersion` is supported, the download is under 20 MB (counted while
+receiving), the module parses, and its only import is `laperm.call`, then writes both files into
+`.laperm/plugins/<id>/` in one step (an update never leaves a new binary next to an old Manifest). Once a day per Plugin it fetches `manifest.json` again and offers an update
 when `version` differs; nothing is updated automatically.
